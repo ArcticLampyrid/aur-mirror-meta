@@ -8,6 +8,9 @@ A system that builds on AUR GitHub Mirror and provides compatible endpoints (try
 4. **Snapshot Proxy** - Redirects package snapshot requests to GitHub archives
 5. **Git Repo Proxy** - Virtualizes each AUR package branch as an independent Git repository
 
+## Details
+See [Product Requirements Document (PRD)](PRD.md) for more information.
+
 ## Compatibility
 Test with [Paru](https://github.com/Morganamilo/paru) and it works well:
 ```bash
