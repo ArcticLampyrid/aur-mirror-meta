@@ -1,7 +1,8 @@
 use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
-use tracing::info;
+use std::process::Command;
+use tracing::{debug, info};
 
 mod app_state;
 mod aur_fetcher;
@@ -62,7 +63,24 @@ async fn main() -> Result<()> {
         .ok_or(anyhow!("Database path is not configured."))?;
     info!("Database file: {}", db_path);
 
-    let github_token = config.github_token();
+    let github_token = config.github_token().or_else(|| {
+        debug!("GitHub token is not set. Try `gh auth token`.");
+        Command::new("gh")
+            .args(["auth", "token"])
+            .output()
+            .ok()
+            .and_then(|output| {
+                if output.status.success() {
+                    let token = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                    if !token.is_empty() {
+                        info!("GitHub token obtained from `gh` CLI.");
+                        return Some(token);
+                    }
+                }
+                None
+            })
+    });
+
     let app_state = AppState::new(&db_path, github_token).await?;
 
     match cli.command {
