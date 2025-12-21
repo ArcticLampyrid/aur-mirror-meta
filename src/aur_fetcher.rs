@@ -1,6 +1,9 @@
 use crate::types::GqlFetchSrcInfoResponse;
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Utc};
+use futures::TryStreamExt;
+use gix_packetline::async_io::StreamingPeekableIter;
+use gix_packetline::PacketLineRef;
 use reqwest::{header, Client};
 use std::collections::HashMap;
 use std::fmt::Write;
@@ -45,17 +48,32 @@ impl AurFetcher {
         if !response.status().is_success() {
             return Err(anyhow!("Failed to fetch refs: {}", response.status()));
         }
-
-        let text = response.text().await?;
+        let mut rd = StreamingPeekableIter::new(
+            response
+                .bytes_stream()
+                .map_err(std::io::Error::other)
+                .into_async_read(),
+            &[PacketLineRef::Flush],
+            false,
+        );
         let mut branches = HashMap::new();
+        while rd.read_line().await.is_some() {
+            // skip first part
+        }
+        rd.reset();
 
-        for line in text.lines() {
-            if let Some((commit, branch_name)) = line.split_once(" refs/heads/") {
-                if commit.len() >= 4 {
-                    let commit_id = &commit[4..]; // Remove the length prefix
-                    if branch_name != "main" {
-                        branches.insert(branch_name.to_string(), commit_id.to_string());
-                    }
+        while let Some(line_res) = rd.read_line().await {
+            let line_str = line_res??
+                .as_bstr()
+                .and_then(|b| std::str::from_utf8(b).ok());
+            let line = match line_str {
+                Some(l) => l,
+                None => continue,
+            };
+            if let Some((commit_id, branch_name)) = line.split_once(" refs/heads/") {
+                let branch_name = branch_name.trim_end();
+                if branch_name != "main" {
+                    branches.insert(branch_name.to_string(), commit_id.to_string());
                 }
             }
         }
