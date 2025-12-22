@@ -1,5 +1,6 @@
 use itertools::Itertools;
 use std::collections::{hash_map, HashMap};
+use tracing::warn;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedSrcInfo {
@@ -96,7 +97,8 @@ impl ParsedSrcInfo {
         }
 
         if result.is_empty() {
-            if let Some(base) = current_pkg.take() {
+            if let Some(base) = current_base.take() {
+                warn!(".SRCINFO without pkgname found, using pkgbase as pkgname");
                 result.push(ParsedSrcInfo {
                     pkgname: base.pkgbase.clone(),
                     pkgbase: base.pkgbase,
