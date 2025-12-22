@@ -13,29 +13,13 @@ AUR Mirror Meta (AMM) is a system that builds on AUR GitHub Mirror and provides 
 - **Data Structure**: `HashMap<String, String>` (branch name → commit ID)
 
 ### 1.2 SRCINFO Content Retrieval
-**Requirement**: Retrieve `.SRCINFO` files for each branch using GitHub GraphQL API
-- **API**: GitHub GraphQL API v4
+**Requirement**: Retrieve `.SRCINFO` files for each branch using Git Http(s) Protocol V2
 - **Authentication**: GitHub token (optional)
-- **Batch Size**: 300 commits per GraphQL query
-- **Rate Limiting**: Automatic retry when rate limiting reached:
-  - Handle standard `Retry-After` headers (both seconds and RFC2822 dates)
-  - Handle GitHub-specific `X-RateLimit-*` headers
-  - With 15 seconds padding
-
-**GraphQL Query Template**:
-```graphql
-query {
-  repository(owner: "archlinux", name: "aur") {
-    x0: object(expression: "<commit_id>:.SRCINFO") {
-      ... on Blob { text }
-    }
-    x1: object(expression: "<commit_id>:.SRCINFO") {
-      ... on Blob { text }
-    }
-    # ... up to 300 entries
-  }
-}
-```
+- **Batch Size**: 3000 commits per query
+- **Fetch Logic**:
+  1. Do a blobless (`filter blob:none`) fetch to get commit & tree objects in packfile response
+  2. Parse commit & tree objects to locate `.SRCINFO` blobs (only get IDs here)
+  3. Do a second fetch to retrieve only the `.SRCINFO` blobs using their IDs
 
 ## Feature 2: SRCINFO Parsing and Indexing
 

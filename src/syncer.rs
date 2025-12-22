@@ -9,7 +9,7 @@ use anyhow::Result;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
-const BATCH_SIZE: usize = 150;
+const BATCH_SIZE: usize = 3000;
 
 pub struct Syncer {
     db: DatabaseOps,

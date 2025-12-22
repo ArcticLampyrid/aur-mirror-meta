@@ -1,26 +1,4 @@
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct GqlFetchSrcInfoResponse {
-    pub data: Option<GqlFetchSrcInfoData>,
-    pub errors: Option<Vec<GraphQLError>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct GqlFetchSrcInfoData {
-    pub repository: HashMap<String, GqlFetchSrcInfoObject>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct GqlFetchSrcInfoObject {
-    pub text: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct GraphQLError {
-    pub message: String,
-}
+use serde::Serialize;
 
 #[derive(Debug, Serialize)]
 pub struct RpcResponse<T> {

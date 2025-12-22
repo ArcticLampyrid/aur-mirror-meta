@@ -1,20 +1,21 @@
-use crate::types::GqlFetchSrcInfoResponse;
 use anyhow::{anyhow, Result};
-use chrono::{DateTime, Utc};
+use async_tempfile::TempFile;
 use futures::TryStreamExt;
-use gix_packetline::async_io::StreamingPeekableIter;
+use gix_hash::{oid, ObjectId};
+use gix_object::{commit, CommitRefIter, TreeRefIter};
+use gix_pack::data;
+use gix_pack::data::input::{self, BytesToEntriesIter, EntryDataMode};
+use gix_packetline::async_io::{encode, StreamingPeekableIter};
+use gix_packetline::read::ProgressAction;
 use gix_packetline::PacketLineRef;
 use reqwest::{header, Client};
 use std::collections::HashMap;
-use std::fmt::Write;
-use std::time::Duration;
-use tokio::time::sleep;
-use tracing::info;
+use tokio_util::compat::TokioAsyncReadCompatExt as _;
+use tracing::{error, trace};
 
 const AUR_GIT_UPLOAD_PACK_GET_URL: &str =
     "https://github.com/archlinux/aur.git/info/refs?service=git-upload-pack";
-const GITHUB_GRAPHQL_URL: &str = "https://api.github.com/graphql";
-const RETRY_AFTER_FINETUNING: i64 = 15;
+const AUR_GIT_UPLOAD_PACK_POST_URL: &str = "https://github.com/archlinux/aur.git/git-upload-pack";
 
 #[derive(Clone)]
 pub struct AurFetcher {
@@ -37,6 +38,120 @@ impl AurFetcher {
 
     pub fn user_agent() -> String {
         format!("AUR-Mirror-Meta/{}", env!("CARGO_PKG_VERSION"))
+    }
+
+    pub async fn fetch_srcinfo_batch(
+        &self,
+        commits: impl Iterator<Item = impl AsRef<str>>,
+    ) -> Result<impl Iterator<Item = String>> {
+        let commit_ids: Vec<ObjectId> = commits
+            .map(|c| ObjectId::from_hex(c.as_ref().as_bytes()).unwrap())
+            .collect();
+        let blob_ids = self.fetch_srcinfo_blob_ids(commit_ids.iter()).await?;
+        let mut blobs = self.fetch_srcinfo_blobs(blob_ids.values()).await?;
+        Ok(commit_ids.into_iter().map(move |commit_id| {
+            blob_ids
+                .get(&commit_id)
+                .and_then(|blob_id| blobs.remove(blob_id))
+                .unwrap_or_default()
+        }))
+    }
+
+    async fn fetch_srcinfo_blob_ids(
+        &self,
+        commits: impl Iterator<Item = impl AsRef<oid>>,
+    ) -> Result<HashMap<ObjectId, ObjectId>> {
+        let mut request_builder = self
+            .client
+            .post(AUR_GIT_UPLOAD_PACK_POST_URL)
+            .header("Git-Protocol", "version=2")
+            .header(header::USER_AGENT, &Self::user_agent());
+        if let Some(token) = &self.github_token {
+            request_builder = request_builder.basic_auth(token, None::<&str>);
+        }
+        {
+            let mut body = Vec::new();
+            encode::text_to_write(b"command=fetch", &mut body).await?;
+            encode::text_to_write(b"agent=git/aur-mirror", &mut body).await?;
+            encode::delim_to_write(&mut body).await?;
+            for commit in commits {
+                encode::text_to_write(format!("want {}", commit.as_ref()).as_bytes(), &mut body)
+                    .await?;
+            }
+            encode::text_to_write(b"ofs-delta", &mut body).await?;
+            encode::text_to_write(b"deepen 1", &mut body).await?;
+            encode::text_to_write(b"filter blob:none", &mut body).await?;
+            encode::text_to_write(b"no-progress", &mut body).await?;
+            encode::text_to_write(b"done", &mut body).await?;
+            encode::flush_to_write(&mut body).await?;
+            request_builder = request_builder.body(body);
+        }
+        let response = request_builder.send().await?;
+        if !response.status().is_success() {
+            return Err(anyhow!("Failed to fetch commits: {}", response.status()));
+        }
+
+        let mut rd = StreamingPeekableIter::new(
+            response
+                .bytes_stream()
+                .map_err(std::io::Error::other)
+                .into_async_read(),
+            &[PacketLineRef::Flush, PacketLineRef::Delimiter],
+            false,
+        );
+
+        let mut packfile = TempFile::new().await?;
+        read_packfile_from_fetch_response(&mut rd, &mut (&mut packfile).compat()).await?;
+        let commit_to_blob_map = map_commit_id_to_srcinfo_blob_id(packfile.file_path())?;
+        Ok(commit_to_blob_map)
+    }
+
+    async fn fetch_srcinfo_blobs(
+        &self,
+        blobs: impl Iterator<Item = impl AsRef<oid>>,
+    ) -> Result<HashMap<ObjectId, std::string::String>> {
+        let mut request_builder = self
+            .client
+            .post(AUR_GIT_UPLOAD_PACK_POST_URL)
+            .header("Git-Protocol", "version=2")
+            .header(header::USER_AGENT, &Self::user_agent());
+        if let Some(token) = &self.github_token {
+            request_builder = request_builder.basic_auth(token, None::<&str>);
+        }
+        {
+            let mut body = Vec::new();
+            encode::text_to_write(b"command=fetch", &mut body).await?;
+            encode::text_to_write(b"agent=git/aur-mirror", &mut body).await?;
+            encode::delim_to_write(&mut body).await?;
+            for blob in blobs {
+                encode::text_to_write(format!("want {}", blob.as_ref()).as_bytes(), &mut body)
+                    .await?;
+            }
+            encode::text_to_write(b"ofs-delta", &mut body).await?;
+            encode::text_to_write(b"no-progress", &mut body).await?;
+            encode::text_to_write(b"done", &mut body).await?;
+            encode::flush_to_write(&mut body).await?;
+            request_builder = request_builder.body(body);
+        }
+        let response = request_builder.send().await?;
+        if !response.status().is_success() {
+            return Err(anyhow!("Failed to fetch commits: {}", response.status()));
+        }
+
+        let mut rd = StreamingPeekableIter::new(
+            response
+                .bytes_stream()
+                .map_err(std::io::Error::other)
+                .into_async_read(),
+            &[PacketLineRef::Flush, PacketLineRef::Delimiter],
+            false,
+        );
+
+        let mut packfile = TempFile::new().await?;
+        read_packfile_from_fetch_response(&mut rd, &mut (&mut packfile).compat()).await?;
+        let blob_id_to_content_map =
+            map_blob_id_to_content(packfile.file_path(), String::from_utf8)?;
+        Ok(blob_id_to_content_map)
     }
 
     pub async fn fetch_branch_list(&self) -> Result<HashMap<String, String>> {
@@ -79,110 +194,175 @@ impl AurFetcher {
         }
         Ok(branches)
     }
+}
 
-    pub async fn fetch_srcinfo_batch(
-        &self,
-        commits: impl Iterator<Item = impl AsRef<str>>,
-    ) -> Result<impl Iterator<Item = String>> {
-        let mut n_commits: usize = 0;
-        let mut query = String::new();
-        query.push_str(r#"query{repository(owner:"archlinux",name:"aur"){"#);
-        for (i, commit) in commits.enumerate() {
-            write!(
-                query,
-                r#"x{}:object(expression:"{}:.SRCINFO"){{... on Blob{{text}}}}"#,
-                i,
-                commit.as_ref()
-            )?;
-            n_commits += 1;
+async fn read_packfile_from_fetch_response<S, D>(
+    rd: &mut StreamingPeekableIter<S>,
+    dest: &mut D,
+) -> anyhow::Result<()>
+where
+    S: futures::io::AsyncRead + Unpin,
+    D: futures::io::AsyncWrite + Unpin,
+{
+    loop {
+        let section_header = rd.read_line().await;
+        if section_header.is_none() {
+            return Err(anyhow!("Missing section header"));
         }
-        query.push_str(r#"}}"#);
-
-        let request_body = serde_json::json!({
-            "query": query
-        });
-
-        let graphql_response = loop {
-            let mut request_builder = self
-                .client
-                .post(GITHUB_GRAPHQL_URL)
-                .header(header::CONTENT_TYPE, "application/json")
-                .header(header::USER_AGENT, &Self::user_agent());
-            if let Some(token) = self.github_token() {
-                request_builder = request_builder.bearer_auth(token);
+        let section_header = section_header
+            .unwrap()??
+            .as_bstr()
+            .and_then(|x| std::str::from_utf8(x).ok())
+            .map(|x: &str| x.trim())
+            .ok_or_else(|| anyhow!("Invalid section header"))?;
+        if section_header != "packfile" {
+            // read all lines and reset
+            while rd.read_line().await.is_some() {
+                // skip
             }
-            let response = request_builder.json(&request_body).send().await?;
-
-            // Handle standard Retry-After headers
-            if let Some(retry_after) = response
-                .headers()
-                .get(header::RETRY_AFTER)
-                .and_then(|v| v.to_str().ok())
-            {
-                if let Ok(retry_after_secs) = retry_after.parse::<i64>() {
-                    let wait_time = retry_after_secs + RETRY_AFTER_FINETUNING;
-                    if wait_time > 0 {
-                        info!("Rate limited. Waiting {} seconds...", wait_time);
-                        sleep(Duration::from_secs(wait_time as u64)).await;
-                    }
-                    continue;
-                } else if let Ok(date) = DateTime::parse_from_rfc2822(retry_after) {
-                    let wait_time =
-                        date.timestamp() - Utc::now().timestamp() + RETRY_AFTER_FINETUNING;
-                    if wait_time > 0 {
-                        info!("Rate limited. Waiting {} seconds...", wait_time);
-                        sleep(Duration::from_secs(wait_time as u64)).await;
-                    }
-                    continue;
-                }
-            }
-
-            // Handle GitHub-specific rate limit headers
-            if response
-                .headers()
-                .get("x-ratelimit-remaining")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.parse::<u32>().ok())
-                == Some(0)
-            {
-                let now = Utc::now().timestamp();
-                let rate_limit_reset = response
-                    .headers()
-                    .get("x-ratelimit-reset")
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|v| v.parse::<i64>().ok())
-                    .unwrap_or(now);
-                let wait_time = rate_limit_reset - now + RETRY_AFTER_FINETUNING;
-                if wait_time > 0 {
-                    info!("Rate limited. Waiting {} seconds...", wait_time);
-                    sleep(Duration::from_secs(wait_time as u64)).await;
-                }
-                continue;
-            }
-
-            if response.status().is_success() {
-                break response.json::<GqlFetchSrcInfoResponse>().await?;
-            } else {
-                return Err(anyhow!("GitHub API error: {}", response.status()));
-            }
-        };
-
-        if let Some(errors) = graphql_response.errors {
-            return Err(anyhow!("GraphQL errors: {:?}", errors));
+            rd.reset();
+            continue;
         }
-
-        let mut data = graphql_response
-            .data
-            .ok_or_else(|| anyhow!("No data in GraphQL response"))?;
-
-        let result = (0..n_commits).map(move |i| {
-            let key = format!("x{}", i);
-            data.repository
-                .remove(&key)
-                .map(|obj| obj.text)
-                .unwrap_or_default()
-        });
-
-        Ok(result)
+        // packfile section
+        futures::io::copy(
+            rd.as_read_with_sidebands(|is_error, msg| {
+                if is_error {
+                    error!("Packfile fetch error: {}", String::from_utf8_lossy(msg));
+                    ProgressAction::Interrupt
+                } else {
+                    trace!("Packfile fetch progress: {}", String::from_utf8_lossy(msg));
+                    ProgressAction::Continue
+                }
+            }),
+            dest,
+        )
+        .await?;
+        break;
     }
+
+    Ok(())
+}
+
+fn map_commit_id_to_srcinfo_blob_id(
+    packfile_path: &std::path::Path,
+) -> anyhow::Result<HashMap<ObjectId, ObjectId>> {
+    let entries_offset = BytesToEntriesIter::new_from_header(
+        std::io::BufReader::with_capacity(4096 * 8, std::fs::File::open(packfile_path)?),
+        input::Mode::AsIs,
+        EntryDataMode::Ignore,
+        gix_hash::Kind::Sha1,
+    )?
+    .filter_map(|x| x.ok().map(|e| e.pack_offset));
+
+    let mut commit_to_tree_map = HashMap::<ObjectId, ObjectId>::new();
+    let mut tree_to_srcinfo_blob_map = HashMap::<ObjectId, ObjectId>::new();
+
+    let pack = data::File::at(packfile_path, gix_hash::Kind::Sha1)?;
+    let mut delta_cache = gix_pack::cache::lru::MemoryCappedHashmap::new(1024 * 1024 * 10);
+    for pack_offset in entries_offset {
+        let entry = pack.entry(pack_offset)?;
+        let mut out = Vec::with_capacity(entry.decompressed_size as usize);
+        let outcome = pack.decode_entry(
+            entry,
+            &mut out,
+            &mut Default::default(),
+            &|_, _| None,
+            &mut delta_cache,
+        )?;
+        let object_id = gix_object::compute_hash(gix_hash::Kind::Sha1, outcome.kind, &out)?;
+        match outcome.kind {
+            gix_object::Kind::Commit => {
+                let tree_id = CommitRefIter::from_bytes(&out)
+                    .filter_map(|commit_field_res| {
+                        if let Ok(commit::ref_iter::Token::Tree { id }) = commit_field_res {
+                            Some(id)
+                        } else {
+                            None
+                        }
+                    })
+                    .next()
+                    .ok_or_else(|| anyhow!("Commit {} missing tree", object_id))?;
+                trace!("Mapping commit {} to tree {}", object_id, tree_id);
+                commit_to_tree_map.insert(object_id, tree_id);
+            }
+            gix_object::Kind::Tree => {
+                let srcinfo_blob_id = TreeRefIter::from_bytes(&out)
+                    .filter_map(|tree_entry_res| {
+                        // find ".SRCINFO" blob
+                        if let Ok(tree_entry) = tree_entry_res {
+                            if tree_entry.filename == b".SRCINFO" && tree_entry.mode.is_blob() {
+                                Some(tree_entry.oid)
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    })
+                    .next();
+                if let Some(srcinfo_blob_id) = srcinfo_blob_id {
+                    trace!(
+                        "Mapping tree {} to .SRCINFO blob {}",
+                        object_id,
+                        srcinfo_blob_id
+                    );
+                    tree_to_srcinfo_blob_map.insert(object_id, srcinfo_blob_id.to_owned());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut commit_to_srcinfo_blob_map = HashMap::<ObjectId, ObjectId>::new();
+    for (commit_id, tree_id) in commit_to_tree_map {
+        if let Some(srcinfo_blob_id) = tree_to_srcinfo_blob_map.remove(&tree_id) {
+            commit_to_srcinfo_blob_map.insert(commit_id, srcinfo_blob_id);
+        }
+    }
+    Ok(commit_to_srcinfo_blob_map)
+}
+
+fn map_blob_id_to_content<T, E>(
+    packfile_path: &std::path::Path,
+    content_parser: fn(Vec<u8>) -> Result<T, E>,
+) -> anyhow::Result<HashMap<ObjectId, T>>
+where
+    E: std::error::Error,
+{
+    let entries_offset = BytesToEntriesIter::new_from_header(
+        std::io::BufReader::with_capacity(4096 * 8, std::fs::File::open(packfile_path)?),
+        input::Mode::AsIs,
+        EntryDataMode::Ignore,
+        gix_hash::Kind::Sha1,
+    )?
+    .filter_map(|x| x.ok().map(|e| e.pack_offset));
+
+    let mut blob_id_to_content_map = HashMap::<ObjectId, T>::new();
+
+    let pack = data::File::at(packfile_path, gix_hash::Kind::Sha1)?;
+    let mut delta_cache = gix_pack::cache::lru::MemoryCappedHashmap::new(1024 * 1024 * 10);
+    for pack_offset in entries_offset {
+        let entry = pack.entry(pack_offset)?;
+        let mut out = Vec::with_capacity(entry.decompressed_size as usize);
+        let outcome = pack.decode_entry(
+            entry,
+            &mut out,
+            &mut Default::default(),
+            &|_, _| None,
+            &mut delta_cache,
+        )?;
+        let object_id = gix_object::compute_hash(gix_hash::Kind::Sha1, outcome.kind, &out)?;
+        if outcome.kind == gix_object::Kind::Blob {
+            match content_parser(out) {
+                Ok(content) => {
+                    blob_id_to_content_map.insert(object_id, content);
+                }
+                Err(err) => {
+                    error!("Failed to parse blob {}: {}", object_id, err);
+                }
+            }
+        }
+    }
+
+    Ok(blob_id_to_content_map)
 }
