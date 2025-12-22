@@ -24,8 +24,7 @@ For other AUR helpers, the compatibility may vary.
 ## Known Limitations
 1. **Some metadata is missing** - Due to GitHub AUR Mirror limitations, metadata like `popularity`, `num_votes`, and `maintainer` is not available.
 2. **Unlisted packages are included** - Also due to GitHub AUR Mirror limitations, we cannot distinguish between listed and unlisted packages.
-3. **Slow for first-time users** - It's slow and may take 3+ hours to build the initial index.
-4. **IPv4 is required for syncing** - GitHub still only supports IPv4, so you’ll need IPv4 connectivity, or at least a DNS64 + NAT64 setup.
+3. **IPv4 is required for syncing** - GitHub still only supports IPv4, so you’ll need IPv4 connectivity, or at least a DNS64 + NAT64 setup.
 
 ## Installation
 ```bash
