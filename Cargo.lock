@@ -110,6 +110,7 @@ dependencies = [
  "dirs",
  "futures",
  "gix-hash",
+ "gix-hashtable",
  "gix-object",
  "gix-pack",
  "gix-packetline",

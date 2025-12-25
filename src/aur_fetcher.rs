@@ -60,7 +60,7 @@ impl AurFetcher {
     async fn fetch_srcinfo_blob_ids(
         &self,
         commits: impl Iterator<Item = impl AsRef<oid>>,
-    ) -> Result<HashMap<ObjectId, ObjectId>> {
+    ) -> Result<gix_hashtable::HashMap<ObjectId, ObjectId>> {
         let mut request_builder = self
             .client
             .post(AUR_GIT_UPLOAD_PACK_POST_URL)
@@ -109,7 +109,7 @@ impl AurFetcher {
     async fn fetch_srcinfo_blobs(
         &self,
         blobs: impl Iterator<Item = impl AsRef<oid>>,
-    ) -> Result<HashMap<ObjectId, std::string::String>> {
+    ) -> Result<gix_hashtable::HashMap<ObjectId, std::string::String>> {
         let mut request_builder = self
             .client
             .post(AUR_GIT_UPLOAD_PACK_POST_URL)
@@ -245,7 +245,7 @@ where
 
 fn map_commit_id_to_srcinfo_blob_id(
     packfile_path: &std::path::Path,
-) -> anyhow::Result<HashMap<ObjectId, ObjectId>> {
+) -> anyhow::Result<gix_hashtable::HashMap<ObjectId, ObjectId>> {
     let entries_offset = BytesToEntriesIter::new_from_header(
         std::io::BufReader::with_capacity(4096 * 8, std::fs::File::open(packfile_path)?),
         input::Mode::AsIs,
@@ -254,8 +254,8 @@ fn map_commit_id_to_srcinfo_blob_id(
     )?
     .filter_map(|x| x.ok().map(|e| e.pack_offset));
 
-    let mut commit_to_tree_map = HashMap::<ObjectId, ObjectId>::new();
-    let mut tree_to_srcinfo_blob_map = HashMap::<ObjectId, ObjectId>::new();
+    let mut commit_to_tree_map = gix_hashtable::HashMap::<ObjectId, ObjectId>::default();
+    let mut tree_to_srcinfo_blob_map = gix_hashtable::HashMap::<ObjectId, ObjectId>::default();
 
     let pack = data::File::at(packfile_path, gix_hash::Kind::Sha1)?;
     let mut delta_cache = gix_pack::cache::lru::MemoryCappedHashmap::new(1024 * 1024 * 10);
@@ -313,7 +313,7 @@ fn map_commit_id_to_srcinfo_blob_id(
         }
     }
 
-    let mut commit_to_srcinfo_blob_map = HashMap::<ObjectId, ObjectId>::new();
+    let mut commit_to_srcinfo_blob_map = gix_hashtable::HashMap::<ObjectId, ObjectId>::default();
     for (commit_id, tree_id) in commit_to_tree_map {
         if let Some(srcinfo_blob_id) = tree_to_srcinfo_blob_map.remove(&tree_id) {
             commit_to_srcinfo_blob_map.insert(commit_id, srcinfo_blob_id);
@@ -325,7 +325,7 @@ fn map_commit_id_to_srcinfo_blob_id(
 fn map_blob_id_to_content<T, E>(
     packfile_path: &std::path::Path,
     content_parser: fn(Vec<u8>) -> Result<T, E>,
-) -> anyhow::Result<HashMap<ObjectId, T>>
+) -> anyhow::Result<gix_hashtable::HashMap<ObjectId, T>>
 where
     E: std::error::Error,
 {
@@ -337,7 +337,7 @@ where
     )?
     .filter_map(|x| x.ok().map(|e| e.pack_offset));
 
-    let mut blob_id_to_content_map = HashMap::<ObjectId, T>::new();
+    let mut blob_id_to_content_map = gix_hashtable::HashMap::<ObjectId, T>::default();
 
     let pack = data::File::at(packfile_path, gix_hash::Kind::Sha1)?;
     let mut delta_cache = gix_pack::cache::lru::MemoryCappedHashmap::new(1024 * 1024 * 10);
