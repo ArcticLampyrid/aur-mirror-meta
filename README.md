@@ -25,6 +25,7 @@ For other AUR helpers, the compatibility may vary.
 1. **Some metadata is missing** - Due to GitHub AUR Mirror limitations, metadata like `popularity`, `num_votes`, and `maintainer` is not available.
 2. **Unlisted packages are included** - Also due to GitHub AUR Mirror limitations, we cannot distinguish between listed and unlisted packages.
 3. **IPv4 is required for syncing** - GitHub still only supports IPv4, so you’ll need IPv4 connectivity, or at least a DNS64 + NAT64 setup.
+4. **AUR cache may need manual cleanup** - Some AUR helpers may store URLs with `aur.archlinux.org` domain (eg. for Paru, all cloned repo under `~/.cache/paru/clone` store remote URLs with the original domain). If you switch to AMM, you may need to clear such cache manually.
 
 ## Installation
 ```bash
