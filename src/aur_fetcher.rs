@@ -23,6 +23,12 @@ pub struct AurFetcher {
     github_token: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct FetchedSrcInfo {
+    pub srcinfo_text: String,
+    pub committed_at: i64,
+}
+
 impl AurFetcher {
     pub fn new(github_token: Option<String>) -> Self {
         let client = Client::new();
@@ -43,24 +49,30 @@ impl AurFetcher {
     pub async fn fetch_srcinfo_batch(
         &self,
         commits: impl Iterator<Item = impl AsRef<str>>,
-    ) -> Result<impl Iterator<Item = String>> {
+    ) -> Result<impl Iterator<Item = Option<FetchedSrcInfo>>> {
         let commit_ids: Vec<ObjectId> = commits
             .map(|c| ObjectId::from_hex(c.as_ref().as_bytes()).unwrap())
             .collect();
-        let blob_ids = self.fetch_srcinfo_blob_ids(commit_ids.iter()).await?;
-        let mut blobs = self.fetch_srcinfo_blobs(blob_ids.values()).await?;
+        let commit_data = self
+            .fetch_srcinfo_blob_ids_and_timestamps(commit_ids.iter())
+            .await?;
+        let blob_ids: Vec<_> = commit_data.values().map(|(blob_id, _)| blob_id).collect();
+        let mut blobs = self.fetch_srcinfo_blobs(blob_ids.into_iter()).await?;
         Ok(commit_ids.into_iter().map(move |commit_id| {
-            blob_ids
-                .get(&commit_id)
-                .and_then(|blob_id| blobs.remove(blob_id))
-                .unwrap_or_default()
+            commit_data.get(&commit_id).map(|(blob_id, timestamp)| {
+                let srcinfo = blobs.remove(blob_id).unwrap_or_default();
+                FetchedSrcInfo {
+                    srcinfo_text: srcinfo,
+                    committed_at: *timestamp,
+                }
+            })
         }))
     }
 
-    async fn fetch_srcinfo_blob_ids(
+    async fn fetch_srcinfo_blob_ids_and_timestamps(
         &self,
         commits: impl Iterator<Item = impl AsRef<oid>>,
-    ) -> Result<gix_hashtable::HashMap<ObjectId, ObjectId>> {
+    ) -> Result<gix_hashtable::HashMap<ObjectId, (ObjectId, i64)>> {
         let mut request_builder = self
             .client
             .post(AUR_GIT_UPLOAD_PACK_POST_URL)
@@ -102,8 +114,9 @@ impl AurFetcher {
 
         let mut packfile = TempFile::new().await?;
         read_packfile_from_fetch_response(&mut rd, &mut (&mut packfile).compat()).await?;
-        let commit_to_blob_map = map_commit_id_to_srcinfo_blob_id(packfile.file_path())?;
-        Ok(commit_to_blob_map)
+        let commit_to_blob_and_timestamp =
+            map_commit_id_to_srcinfo_blob_id_and_timestamp(packfile.file_path())?;
+        Ok(commit_to_blob_and_timestamp)
     }
 
     async fn fetch_srcinfo_blobs(
@@ -243,9 +256,9 @@ where
     Ok(())
 }
 
-fn map_commit_id_to_srcinfo_blob_id(
+fn map_commit_id_to_srcinfo_blob_id_and_timestamp(
     packfile_path: &std::path::Path,
-) -> anyhow::Result<gix_hashtable::HashMap<ObjectId, ObjectId>> {
+) -> anyhow::Result<gix_hashtable::HashMap<ObjectId, (ObjectId, i64)>> {
     let entries_offset = BytesToEntriesIter::new_from_header(
         std::io::BufReader::with_capacity(4096 * 8, std::fs::File::open(packfile_path)?),
         input::Mode::AsIs,
@@ -254,7 +267,8 @@ fn map_commit_id_to_srcinfo_blob_id(
     )?
     .filter_map(|x| x.ok().map(|e| e.pack_offset));
 
-    let mut commit_to_tree_map = gix_hashtable::HashMap::<ObjectId, ObjectId>::default();
+    let mut commit_to_tree_and_timestamp =
+        gix_hashtable::HashMap::<ObjectId, (ObjectId, i64)>::default();
     let mut tree_to_srcinfo_blob_map = gix_hashtable::HashMap::<ObjectId, ObjectId>::default();
 
     let pack = data::File::at(packfile_path, gix_hash::Kind::Sha1)?;
@@ -272,18 +286,32 @@ fn map_commit_id_to_srcinfo_blob_id(
         let object_id = gix_object::compute_hash(gix_hash::Kind::Sha1, outcome.kind, &out)?;
         match outcome.kind {
             gix_object::Kind::Commit => {
-                let tree_id = CommitRefIter::from_bytes(&out)
-                    .filter_map(|commit_field_res| {
-                        if let Ok(commit::ref_iter::Token::Tree { id }) = commit_field_res {
-                            Some(id)
-                        } else {
-                            None
+                let mut tree_id = None;
+                let mut commit_time = None;
+
+                for token in CommitRefIter::from_bytes(&out) {
+                    match token {
+                        Ok(commit::ref_iter::Token::Tree { id }) => {
+                            tree_id = Some(id);
                         }
-                    })
-                    .next()
-                    .ok_or_else(|| anyhow!("Commit {} missing tree", object_id))?;
-                trace!("Mapping commit {} to tree {}", object_id, tree_id);
-                commit_to_tree_map.insert(object_id, tree_id);
+                        Ok(commit::ref_iter::Token::Committer { signature }) => {
+                            commit_time = signature.time().ok();
+                        }
+                        _ => {}
+                    }
+                }
+
+                let tree_id =
+                    tree_id.ok_or_else(|| anyhow!("Commit {} missing tree", object_id))?;
+                let commit_time =
+                    commit_time.ok_or_else(|| anyhow!("Commit {} missing time", object_id))?;
+                trace!(
+                    "Mapping commit {} to tree {} with timestamp {}",
+                    object_id,
+                    tree_id,
+                    commit_time
+                );
+                commit_to_tree_and_timestamp.insert(object_id, (tree_id, commit_time.seconds));
             }
             gix_object::Kind::Tree => {
                 let srcinfo_blob_id = TreeRefIter::from_bytes(&out)
@@ -313,13 +341,14 @@ fn map_commit_id_to_srcinfo_blob_id(
         }
     }
 
-    let mut commit_to_srcinfo_blob_map = gix_hashtable::HashMap::<ObjectId, ObjectId>::default();
-    for (commit_id, tree_id) in commit_to_tree_map {
+    let mut commit_to_srcinfo_and_timestamp =
+        gix_hashtable::HashMap::<ObjectId, (ObjectId, i64)>::default();
+    for (commit_id, (tree_id, timestamp)) in commit_to_tree_and_timestamp {
         if let Some(srcinfo_blob_id) = tree_to_srcinfo_blob_map.remove(&tree_id) {
-            commit_to_srcinfo_blob_map.insert(commit_id, srcinfo_blob_id);
+            commit_to_srcinfo_and_timestamp.insert(commit_id, (srcinfo_blob_id, timestamp));
         }
     }
-    Ok(commit_to_srcinfo_blob_map)
+    Ok(commit_to_srcinfo_and_timestamp)
 }
 
 fn map_blob_id_to_content<T, E>(

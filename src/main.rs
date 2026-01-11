@@ -10,6 +10,7 @@ mod config;
 mod database;
 mod rpc_server;
 mod srcinfo_parse;
+mod supplement_fetcher;
 mod syncer;
 mod types;
 
@@ -38,7 +39,12 @@ enum Commands {
         token: String,
     },
     /// Sync metadata from AUR GitHub Mirror
-    Sync,
+    Sync {
+        /// Source(s) for supplementing metadata (can be 'none', a file path, or a URL).
+        /// Can be specified multiple times for fallback sources.
+        #[arg(short = 's', long = "supplement-source", default_values_t = vec!["https://aur.archlinux.org/packages-meta-ext-v1.json.gz".to_string()])]
+        supplement_source: Vec<String>,
+    },
     /// Start HTTP RPC server
     Serve {
         /// Address to bind to
@@ -90,9 +96,9 @@ async fn main() -> Result<()> {
             })?;
             info!("GitHub token saved to config file.");
         }
-        Commands::Sync => {
+        Commands::Sync { supplement_source } => {
             let syncer = Syncer::new(app_state);
-            syncer.sync().await?;
+            syncer.sync(&supplement_source).await?;
         }
         Commands::Serve { bind } => {
             let server = RpcServer::new(app_state);

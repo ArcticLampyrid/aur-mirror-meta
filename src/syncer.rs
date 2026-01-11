@@ -1,9 +1,7 @@
 use crate::{
-    app_state::AppState,
-    aur_fetcher::AurFetcher,
-    database::DatabaseOps,
-    srcinfo_parse::ParsedSrcInfo,
-    types::{DatabasePackageDetails, DatabasePackageInfo},
+    app_state::AppState, aur_fetcher::AurFetcher, database::DatabaseOps,
+    srcinfo_parse::ParsedSrcInfo, supplement_fetcher::SupplementFetcher,
+    types::DatabasePackageDetails,
 };
 use anyhow::Result;
 use tokio::sync::mpsc;
@@ -20,6 +18,7 @@ struct SrcInfoTuple {
     branch: String,
     commit: String,
     srcinfo_text: String,
+    committed_at: i64,
 }
 
 impl Syncer {
@@ -31,7 +30,7 @@ impl Syncer {
         }
     }
 
-    pub async fn sync(&self) -> Result<()> {
+    pub async fn sync(&self, supplement_sources: &[String]) -> Result<()> {
         info!("Starting sync operation...");
 
         if self.fetcher.github_token().is_none() {
@@ -55,6 +54,8 @@ impl Syncer {
         info!("Need to process {} updated branches", to_process.len());
         if to_process.is_empty() {
             info!("All branches are up to date");
+            // Still fetch supplement data even if no updates
+            self.fetch_and_store_supplements(supplement_sources).await?;
             return Ok(());
         }
 
@@ -66,18 +67,30 @@ impl Syncer {
                 let commits = chunk.iter().map(|(_, commit)| commit.as_str());
                 match fetcher.fetch_srcinfo_batch(commits).await {
                     Ok(srcinfo_data) => {
-                        for ((branch, commit), srcinfo_text) in chunk.iter().zip(srcinfo_data) {
-                            if let Err(e) = db_sender
-                                .send(SrcInfoTuple {
-                                    branch: branch.clone(),
-                                    commit: commit.clone(),
-                                    srcinfo_text,
-                                })
-                                .await
-                            {
-                                error!("Failed to send srcinfo to database task: {}", e);
-                                break;
-                            }
+                        for ((branch, commit), fetched_srcinfo) in chunk.iter().zip(srcinfo_data) {
+                            match fetched_srcinfo {
+                                None => {
+                                    warn!(
+                                        "⚠ No srcinfo found for branch {} ({})",
+                                        branch,
+                                        &commit[..8]
+                                    );
+                                }
+                                Some(data) => {
+                                    if let Err(e) = db_sender
+                                        .send(SrcInfoTuple {
+                                            branch: branch.clone(),
+                                            commit: commit.clone(),
+                                            srcinfo_text: data.srcinfo_text,
+                                            committed_at: data.committed_at,
+                                        })
+                                        .await
+                                    {
+                                        error!("Failed to send srcinfo to database task: {}", e);
+                                        break;
+                                    }
+                                }
+                            };
                         }
                     }
                     Err(e) => {
@@ -107,6 +120,7 @@ impl Syncer {
                 branch,
                 commit,
                 srcinfo_text,
+                committed_at,
             } in srcinfo_batch.iter()
             {
                 self.db.clear_index_with_tx(&mut tx, branch).await?;
@@ -114,7 +128,8 @@ impl Syncer {
                     .update_branch_commit_with_tx(&mut tx, branch, commit)
                     .await?;
 
-                let branch_packages = srcinfo_to_db_models(branch, commit, srcinfo_text);
+                let branch_packages =
+                    srcinfo_to_db_models(branch, commit, *committed_at, srcinfo_text);
 
                 let before_len = packages_batch.len();
                 packages_batch.extend(branch_packages);
@@ -141,10 +156,36 @@ impl Syncer {
 
         fetch_task.await?;
 
-        info!(
-            "✅ Sync completed successfully. Processed {} packages",
-            processed_packages
-        );
+        // Fetch and store supplement data
+        self.fetch_and_store_supplements(supplement_sources).await?;
+
+        info!("✅ Sync completed successfully");
+
+        Ok(())
+    }
+
+    async fn fetch_and_store_supplements(&self, supplement_sources: &[String]) -> Result<()> {
+        if !supplement_sources.iter().any(|x| x != "none") {
+            info!("Skipping supplement data fetch");
+            return Ok(());
+        }
+
+        info!("Fetching supplement data...");
+        let fetcher = SupplementFetcher::new();
+        match fetcher.fetch_supplement_data(supplement_sources).await {
+            Ok(supplements) => {
+                if !supplements.is_empty() {
+                    info!("Storing {} supplement records...", supplements.len());
+                    self.db.store_supplement_data(&supplements).await?;
+                    info!("Supplement data stored successfully");
+                } else {
+                    info!("No supplement data to store");
+                }
+            }
+            Err(e) => {
+                warn!("⚠ {}. Continuing without supplements.", e);
+            }
+        }
         Ok(())
     }
 }
@@ -152,6 +193,7 @@ impl Syncer {
 fn srcinfo_to_db_models(
     branch: &str,
     commit_id: &str,
+    committed_at: i64,
     srcinfo: &str,
 ) -> impl Iterator<Item = DatabasePackageDetails> {
     let branch = branch.to_string();
@@ -159,14 +201,13 @@ fn srcinfo_to_db_models(
     ParsedSrcInfo::parse(srcinfo)
         .into_iter()
         .map(move |pkg| DatabasePackageDetails {
-            info: DatabasePackageInfo {
-                branch: branch.clone(),
-                commit_id: commit_id.clone(),
-                pkg_name: pkg.pkgname.clone(),
-                pkg_desc: pkg.first_prop("pkgdesc").map(|s| s.to_string()),
-                version: pkg.version(),
-                url: pkg.first_prop("url").map(|s| s.to_string()),
-            },
+            branch: branch.clone(),
+            commit_id: commit_id.clone(),
+            committed_at,
+            pkg_name: pkg.pkgname.clone(),
+            pkg_desc: pkg.first_prop("pkgdesc").map(|s| s.to_string()),
+            version: pkg.version(),
+            url: pkg.first_prop("url").map(|s| s.to_string()),
             groups: pkg.prop("groups"),
             depends: pkg.flatten_arch_prop("depends"),
             make_depends: pkg.flatten_arch_prop("makedepends"),
