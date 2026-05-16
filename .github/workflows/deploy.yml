@@ -1,0 +1,89 @@
+name: Deploy
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*.*.*"
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  generate-release-notes:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: latest
+      - run: npx changelogithub ${{ github.event_name == 'push' && github.ref_type == 'tag' && '--draft' || '--dry'}}
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+  deploy-linux:
+    runs-on: ubuntu-22.04
+    needs:
+      - generate-release-notes
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+      - name: Build (Release)
+        run: cargo build --release --target x86_64-unknown-linux-gnu --verbose
+      - name: Package
+        run: |
+          rust_target='x86_64-unknown-linux-gnu'
+          version=$(git describe --tags --dirty --always)
+          unpacked_dir=unpacked/aur-mirror-meta
+          mkdir -p "$unpacked_dir"
+          cp "target/$rust_target/release/aur-mirror-meta" "$unpacked_dir/"
+          mkdir -p release
+          tar -czf "release/aur-mirror-meta-${version}-linux-x86_64.tar.gz" -C unpacked .
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: aur-mirror-meta-linux-x86_64
+          path: release/*
+          if-no-files-found: error
+
+  publish-release:
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    needs:
+      - deploy-linux
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release
+      - name: Collect release files
+        run: |
+          mkdir -p upload
+          find release -type f -exec cp {} upload/ \;
+      - name: Attest build provenance
+        id: provenance
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: upload/*.tar.gz
+      - name: Rename provenance file
+        run: mv "${{ steps.provenance.outputs.bundle-path }}" upload/aur-mirror-meta-attestation.json
+      - name: Release (GitHub)
+        uses: ncipollo/release-action@v1
+        with:
+          allowUpdates: true
+          draft: false
+          omitBody: true
+          artifacts: "upload/*"
