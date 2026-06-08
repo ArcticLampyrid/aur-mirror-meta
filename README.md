@@ -34,6 +34,7 @@ cargo build --release
 ```
 
 ## Usage
+### Manually execution
 ```bash
 # Login to GitHub with Personal Access Token
 # (Optional, but recommended to avoid rate limiting)
@@ -60,6 +61,9 @@ aur-mirror-meta serve
 # Show help
 aur-mirror-meta --help
 ```
+
+### Long-lived service
+To run AMM as a long-lived service, with automatic syncing — see [Deploying with systemd](docs/systemd.md).
 
 ## Security
 The config file stores your GitHub Personal Access Token (PAT) in plaintext. Please handle this file carefully to protect your credentials.
