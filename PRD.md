@@ -108,6 +108,7 @@ pkgname = package-name
    - Commit transaction atomically
 4. **Batch Processing**: Process multiple branches in single transactions for efficiency
 5. **Commit Timestamp Tracking**: Record sync timestamp as `committed_at` for each package to enable unlisted package detection
+6. **Serve During Sync**: SQLite runs in WAL mode with a 30-second busy timeout so readers can continue serving committed snapshots while sync writes. It is acceptable for served data to contain a mix of old and new committed batches, but readers must not observe the transient empty state between deleting old branch rows and inserting replacement rows.
 
 ## Feature 3: Metadata Supplementation from AUR Website
 
@@ -140,7 +141,7 @@ pkgname = package-name
 2. Detect gzip compression (magic bytes `1f 8b`) and decompress if needed
 3. Parse JSON array of package metadata objects
 4. Store in `pkg_supplement` table
-5. Update `is_listed` status for all packages
+5. Update `is_listed` status for all packages in the same transaction as the supplement replacement
 
 **Sample JSON Structure**:
 ```json
@@ -245,6 +246,7 @@ GET /rpc?v=5&type=search&arg=editor&callback=myCallback
 
 **Parameter Handling**:
 - **Batch Queries**: Multiple packages can be queried in single request
+- **Snapshot Consistency**: Each info request reads package rows and related dependency/provides/conflicts/group rows within one database transaction so all fields in the response come from the same committed snapshot.
 
 **Examples**:
 ```

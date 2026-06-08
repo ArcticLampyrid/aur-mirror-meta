@@ -6,6 +6,7 @@ use anyhow::Result;
 use futures::stream::TryStreamExt;
 use sqlx::{sqlite::SqliteConnectOptions, Row, SqlitePool};
 use std::collections::HashMap;
+use std::time::Duration;
 use tracing::info;
 
 const CURRENT_DB_VERSION: i32 = 2;
@@ -20,7 +21,9 @@ impl DatabaseOps {
         let pool = SqlitePool::connect_with(
             SqliteConnectOptions::new()
                 .filename(db_path)
-                .create_if_missing(true),
+                .create_if_missing(true)
+                .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+                .busy_timeout(Duration::from_secs(30)),
         )
         .await?;
         let result = Self { pool };
@@ -538,124 +541,124 @@ impl DatabaseOps {
             query_builder = query_builder.bind(name);
         }
 
-        query_builder
-            .fetch(&self.pool)
-            .and_then(
-                async |row| -> sqlx::Result<DatabasePackageDetailsWithSupplement> {
-                    let pkg_version: String = row.get("version");
-                    let supplement_version: Option<String> = row.try_get("s_version").ok();
-                    let version_matches = supplement_version
-                        .as_ref()
-                        .map(|v| v == &pkg_version)
-                        .unwrap_or(false);
+        let mut tx = self.begin_transaction().await?;
+        let rows = query_builder.fetch_all(&mut *tx).await?;
+        let mut results = Vec::with_capacity(rows.len());
 
-                    let info = DatabasePackageInfoWithSupplement {
-                        commit_id: row.get("commit_id"),
-                        committed_at: row.get("committed_at"),
-                        branch: row.get("branch"),
-                        pkg_name: row.get("pkg_name"),
-                        pkg_desc: row.get("pkg_desc"),
-                        version: pkg_version,
-                        url: row.get("url"),
-                        popularity: row.try_get("popularity").ok(),
-                        num_votes: row.try_get("num_votes").ok(),
-                        out_of_date: if version_matches {
-                            row.try_get("out_of_date").ok().flatten()
-                        } else {
-                            None
-                        },
-                        maintainer: row.try_get("maintainer").ok().flatten(),
-                        submitter: row.try_get("submitter").ok().flatten(),
-                        first_submitted: row.try_get("first_submitted").ok(),
-                        last_modified: if version_matches {
-                            row.try_get("last_modified").ok()
-                        } else {
-                            None
-                        },
-                    };
+        for row in rows {
+            let pkg_version: String = row.get("version");
+            let supplement_version: Option<String> = row.try_get("s_version").ok();
+            let version_matches = supplement_version
+                .as_ref()
+                .map(|v| v == &pkg_version)
+                .unwrap_or(false);
 
-                    let package_name: String = row.get("pkg_name");
-                    let pkg_branch: String = row.get("branch");
-
-                    let tables = vec![
-                        ("pkg_depends", "depend"),
-                        ("pkg_make_depends", "make_depend"),
-                        ("pkg_opt_depends", "opt_depend"),
-                        ("pkg_check_depends", "check_depend"),
-                        ("pkg_provides", "provide"),
-                        ("pkg_conflicts", "conflict"),
-                        ("pkg_replaces", "replace"),
-                        ("pkg_groups", "group_name"),
-                    ];
-
-                    let mut depends = Vec::new();
-                    let mut make_depends = Vec::new();
-                    let mut opt_depends = Vec::new();
-                    let mut check_depends = Vec::new();
-                    let mut provides = Vec::new();
-                    let mut conflicts = Vec::new();
-                    let mut replaces = Vec::new();
-                    let mut groups = Vec::new();
-
-                    for (table, column) in tables {
-                        let query = format!(
-                            "SELECT {} FROM {} WHERE pkg_name = ? AND branch = ?",
-                            column, table
-                        );
-                        let values = sqlx::query(&query)
-                            .bind(&package_name)
-                            .bind(&pkg_branch)
-                            .fetch(&self.pool)
-                            .map_ok(|row| row.get::<String, _>(column))
-                            .try_collect()
-                            .await?;
-
-                        match column {
-                            "depend" => depends = values,
-                            "make_depend" => make_depends = values,
-                            "opt_depend" => opt_depends = values,
-                            "check_depend" => check_depends = values,
-                            "provide" => provides = values,
-                            "conflict" => conflicts = values,
-                            "replace" => replaces = values,
-                            "group_name" => groups = values,
-                            _ => {}
-                        }
-                    }
-
-                    // Parse keywords and co_maintainers from JSON
-                    let keywords: Vec<String> = row
-                        .try_get::<Option<String>, _>("keywords")
-                        .ok()
-                        .flatten()
-                        .and_then(|s| serde_json::from_str(&s).ok())
-                        .unwrap_or_default();
-
-                    let co_maintainers: Vec<String> = row
-                        .try_get::<Option<String>, _>("co_maintainers")
-                        .ok()
-                        .flatten()
-                        .and_then(|s| serde_json::from_str(&s).ok())
-                        .unwrap_or_default();
-
-                    Ok(DatabasePackageDetailsWithSupplement {
-                        info,
-                        depends,
-                        make_depends,
-                        opt_depends,
-                        check_depends,
-                        provides,
-                        conflicts,
-                        replaces,
-                        groups,
-                        keywords,
-                        co_maintainers,
-                    })
+            let info = DatabasePackageInfoWithSupplement {
+                commit_id: row.get("commit_id"),
+                committed_at: row.get("committed_at"),
+                branch: row.get("branch"),
+                pkg_name: row.get("pkg_name"),
+                pkg_desc: row.get("pkg_desc"),
+                version: pkg_version,
+                url: row.get("url"),
+                popularity: row.try_get("popularity").ok(),
+                num_votes: row.try_get("num_votes").ok(),
+                out_of_date: if version_matches {
+                    row.try_get("out_of_date").ok().flatten()
+                } else {
+                    None
                 },
-            )
-            .try_collect()
-            .await
-            .map_err(Into::into)
+                maintainer: row.try_get("maintainer").ok().flatten(),
+                submitter: row.try_get("submitter").ok().flatten(),
+                first_submitted: row.try_get("first_submitted").ok(),
+                last_modified: if version_matches {
+                    row.try_get("last_modified").ok()
+                } else {
+                    None
+                },
+            };
+
+            let package_name: String = row.get("pkg_name");
+            let pkg_branch: String = row.get("branch");
+
+            let tables = vec![
+                ("pkg_depends", "depend"),
+                ("pkg_make_depends", "make_depend"),
+                ("pkg_opt_depends", "opt_depend"),
+                ("pkg_check_depends", "check_depend"),
+                ("pkg_provides", "provide"),
+                ("pkg_conflicts", "conflict"),
+                ("pkg_replaces", "replace"),
+                ("pkg_groups", "group_name"),
+            ];
+
+            let mut depends = Vec::new();
+            let mut make_depends = Vec::new();
+            let mut opt_depends = Vec::new();
+            let mut check_depends = Vec::new();
+            let mut provides = Vec::new();
+            let mut conflicts = Vec::new();
+            let mut replaces = Vec::new();
+            let mut groups = Vec::new();
+
+            for (table, column) in tables {
+                let query = format!(
+                    "SELECT {} FROM {} WHERE pkg_name = ? AND branch = ?",
+                    column, table
+                );
+                let values = sqlx::query(&query)
+                    .bind(&package_name)
+                    .bind(&pkg_branch)
+                    .fetch(&mut *tx)
+                    .map_ok(|row| row.get::<String, _>(column))
+                    .try_collect()
+                    .await?;
+
+                match column {
+                    "depend" => depends = values,
+                    "make_depend" => make_depends = values,
+                    "opt_depend" => opt_depends = values,
+                    "check_depend" => check_depends = values,
+                    "provide" => provides = values,
+                    "conflict" => conflicts = values,
+                    "replace" => replaces = values,
+                    "group_name" => groups = values,
+                    _ => {}
+                }
+            }
+
+            // Parse keywords and co_maintainers from JSON
+            let keywords: Vec<String> = row
+                .try_get::<Option<String>, _>("keywords")
+                .ok()
+                .flatten()
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or_default();
+
+            let co_maintainers: Vec<String> = row
+                .try_get::<Option<String>, _>("co_maintainers")
+                .ok()
+                .flatten()
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or_default();
+
+            results.push(DatabasePackageDetailsWithSupplement {
+                info,
+                depends,
+                make_depends,
+                opt_depends,
+                check_depends,
+                provides,
+                conflicts,
+                replaces,
+                groups,
+                keywords,
+                co_maintainers,
+            });
+        }
+
+        tx.commit().await?;
+        Ok(results)
     }
 
     pub async fn get_branch_commit_id(&self, branch: &str) -> Result<Option<String>> {
@@ -703,18 +706,20 @@ impl DatabaseOps {
             .await?;
         }
 
+        self.update_is_listed_status_with_tx(&mut tx).await?;
         tx.commit().await?;
-
-        self.update_is_listed_status().await?;
 
         Ok(())
     }
 
-    async fn update_is_listed_status(&self) -> Result<()> {
+    async fn update_is_listed_status_with_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    ) -> Result<()> {
         // Get max last_modified from supplement data
         let max_last_modified: Option<i64> =
             sqlx::query("SELECT MAX(last_modified) FROM pkg_supplement")
-                .fetch_one(&self.pool)
+                .fetch_one(&mut **tx)
                 .await?
                 .get(0);
 
@@ -734,7 +739,7 @@ impl DatabaseOps {
                 "#,
             )
             .bind(threshold)
-            .execute(&self.pool)
+            .execute(&mut **tx)
             .await?;
         }
 
